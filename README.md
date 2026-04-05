@@ -102,6 +102,21 @@ npx tsx bin/tl stop     # 정지
 npx tsx bin/tl status   # 상태 확인
 ```
 
+## 🤖 Codex에서 설치하기
+
+Codex에게 TL 설치를 맡길 수 있습니다:
+
+```bash
+cd ~/Projects/TL
+codex exec --full-auto "Follow the instructions in PROMPTS.md to install and configure TL"
+```
+
+또는 한 줄로:
+
+```bash
+cd ~/Projects/TL && codex exec --full-auto "npm install && npm run build && mkdir -p ~/.codex && echo -e '[features]\ncodex_hooks = true' >> ~/.codex/config.toml && cp templates/hooks.json ~/.codex/hooks.json && npm install -g ."
+```
+
 ---
 
 ## 📋 CLI 명령어
