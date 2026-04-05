@@ -1,0 +1,208 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { SessionsStore } from '../src/store.js';
+import { SessionRecord } from '../src/types.js';
+import { TlError } from '../src/errors.js';
+
+function makeTestDir(): string {
+  return path.join(os.tmpdir(), `tl-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+}
+
+function makeRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
+  const now = new Date().toISOString();
+  return {
+    status: 'active',
+    project: 'test-project',
+    cwd: '/tmp/test',
+    model: 'gpt-4',
+    topic_id: 0,
+    start_message_id: 0,
+    started_at: now,
+    completed_at: null,
+    stop_message_id: null,
+    reply_message_id: null,
+    total_turns: 0,
+    last_user_message: '',
+    last_turn_output: '',
+    ...overrides,
+  };
+}
+
+describe('SessionsStore', () => {
+  let store: SessionsStore;
+  let testDir: string;
+
+  beforeEach(() => {
+    testDir = makeTestDir();
+    process.env.TL_DATA_DIR = testDir;
+    store = new SessionsStore();
+  });
+
+  afterEach(() => {
+    delete process.env.TL_DATA_DIR;
+    if (fs.existsSync(testDir)) {
+      fs.rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+
+  describe('load', () => {
+    it('creates data directory and empty sessions file if not exists', async () => {
+      await store.load();
+      expect(fs.existsSync(testDir)).toBe(true);
+      const data = JSON.parse(fs.readFileSync(path.join(testDir, 'sessions.json'), 'utf-8'));
+      expect(data.sessions).toEqual({});
+      expect(data.version).toBe(1);
+    });
+
+    it('loads existing sessions', async () => {
+      fs.mkdirSync(testDir, { recursive: true });
+      const sessionsPath = path.join(testDir, 'sessions.json');
+      fs.writeFileSync(sessionsPath, JSON.stringify({
+        sessions: { 's1': makeRecord({ status: 'active' }) },
+        version: 1,
+      }));
+
+      await store.load();
+      const entry = store.get('s1');
+      expect(entry).toBeDefined();
+      expect(entry!.record.status).toBe('active');
+    });
+
+    it('falls back to backup if primary is corrupted', async () => {
+      fs.mkdirSync(testDir, { recursive: true });
+      const sessionsPath = path.join(testDir, 'sessions.json');
+      const backupPath = path.join(testDir, 'sessions.json.bak');
+
+      fs.writeFileSync(sessionsPath, 'NOT JSON');
+      fs.writeFileSync(backupPath, JSON.stringify({
+        sessions: { 's2': makeRecord({ status: 'waiting' }) },
+        version: 1,
+      }));
+
+      await store.load();
+      const entry = store.get('s2');
+      expect(entry).toBeDefined();
+      expect(entry!.record.status).toBe('waiting');
+    });
+
+    it('initializes fresh if both primary and backup are corrupted', async () => {
+      fs.mkdirSync(testDir, { recursive: true });
+      fs.writeFileSync(path.join(testDir, 'sessions.json'), 'BAD');
+      fs.writeFileSync(path.join(testDir, 'sessions.json.bak'), 'ALSO BAD');
+
+      await store.load();
+      const entry = store.get('any');
+      expect(entry).toBeUndefined();
+    });
+  });
+
+  describe('get', () => {
+    beforeEach(async () => {
+      await store.load();
+      store.set('s1', makeRecord({ status: 'active' }));
+      await store.save();
+    });
+
+    it('returns { id, record } for existing session', () => {
+      const entry = store.get('s1');
+      expect(entry).toBeDefined();
+      expect(entry!.id).toBe('s1');
+      expect(entry!.record.status).toBe('active');
+    });
+
+    it('returns undefined for non-existing session', () => {
+      expect(store.get('nonexistent')).toBeUndefined();
+    });
+  });
+
+  describe('create', () => {
+    beforeEach(async () => {
+      await store.load();
+    });
+
+    it('creates a new session', () => {
+      store.create('new-s', makeRecord());
+      const entry = store.get('new-s');
+      expect(entry).toBeDefined();
+    });
+
+    it('throws if session already exists', () => {
+      store.create('dup', makeRecord());
+      expect(() => store.create('dup', makeRecord())).toThrow(TlError);
+    });
+  });
+
+  describe('update', () => {
+    beforeEach(async () => {
+      await store.load();
+      store.set('s1', makeRecord({ status: 'active', total_turns: 5 }));
+    });
+
+    it('updates via callback function', () => {
+      store.update('s1', (record) => {
+        record.status = 'waiting';
+        record.total_turns = 6;
+      });
+      const entry = store.get('s1');
+      expect(entry!.record.status).toBe('waiting');
+      expect(entry!.record.total_turns).toBe(6);
+    });
+
+    it('throws if session not found', () => {
+      expect(() => store.update('nope', () => {})).toThrow(TlError);
+    });
+  });
+
+  describe('listActive', () => {
+    beforeEach(async () => {
+      await store.load();
+      store.set('a1', makeRecord({ status: 'active' }));
+      store.set('w1', makeRecord({ status: 'waiting' }));
+      store.set('c1', makeRecord({ status: 'completed' }));
+    });
+
+    it('returns active and waiting sessions', () => {
+      const list = store.listActive();
+      expect(list).toHaveLength(2);
+      const ids = list.map((e) => e.id);
+      expect(ids).toContain('a1');
+      expect(ids).toContain('w1');
+    });
+  });
+
+  describe('archiveCompleted', () => {
+    beforeEach(async () => {
+      await store.load();
+      const oldDate = new Date();
+      oldDate.setDate(oldDate.getDate() - 35);
+      store.set('old', makeRecord({
+        status: 'completed',
+        started_at: oldDate.toISOString(),
+        completed_at: oldDate.toISOString(),
+      }));
+      store.set('new', makeRecord({
+        status: 'completed',
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+      }));
+      store.set('active', makeRecord({ status: 'active' }));
+      await store.save();
+    });
+
+    it('archives old completed sessions', async () => {
+      const count = await store.archiveCompleted(30);
+      expect(count).toBe(1);
+
+      expect(store.get('old')).toBeUndefined();
+      expect(store.get('new')).toBeDefined();
+      expect(store.get('active')).toBeDefined();
+
+      const archivePath = path.join(testDir, 'sessions-archive.json');
+      expect(fs.existsSync(archivePath)).toBe(true);
+      const archive = JSON.parse(fs.readFileSync(archivePath, 'utf-8'));
+      expect(archive.sessions['old']).toBeDefined();
+    });
+  });
+});

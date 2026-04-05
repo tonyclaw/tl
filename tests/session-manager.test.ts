@@ -1,0 +1,256 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { SessionManagerImpl } from '../src/session-manager.js';
+import { SessionsStore } from '../src/store.js';
+import { ReplyQueue } from '../src/reply-queue.js';
+import { SessionRecord, DaemonConfig, HookOutput } from '../src/types.js';
+import { TlError } from '../src/errors.js';
+
+// ===== Mocks =====
+
+function makeStore() {
+  const sessions: Record<string, SessionRecord> = {};
+  return {
+    load: vi.fn().mockResolvedValue(undefined),
+    save: vi.fn().mockResolvedValue(undefined),
+    get: vi.fn(function (id: string) {
+      const r = sessions[id];
+      return r ? { id, record: r } : undefined;
+    }),
+    set: vi.fn(function (id: string, r: SessionRecord) { sessions[id] = r; }),
+    create: vi.fn(function (id: string, r: SessionRecord) {
+      if (sessions[id]) throw new TlError(`exists`, 'SESSION_EXISTS');
+      sessions[id] = r;
+    }),
+    update: vi.fn(function (id: string, fn: (r: SessionRecord) => void) {
+      if (!sessions[id]) throw new TlError(`not found`, 'SESSION_NOT_FOUND');
+      fn(sessions[id]);
+    }),
+    delete: vi.fn(function (id: string) { delete sessions[id]; }),
+    listActive: vi.fn(function () {
+      return Object.entries(sessions)
+        .filter(([, r]) => r.status === 'active' || r.status === 'waiting')
+        .map(([id, record]) => ({ id, record }));
+    }),
+    listByStatus: vi.fn(function (status: string) {
+      return Object.entries(sessions)
+        .filter(([, r]) => r.status === status)
+        .map(([id, record]) => ({ id, record }));
+    }),
+    archiveCompleted: vi.fn().mockResolvedValue(0),
+    _sessions: sessions,
+  };
+}
+
+function makeReplyQueue() {
+  return {
+    waitFor: vi.fn(async (_sessionId: string, _timeout: number): Promise<HookOutput> => {
+      return { decision: 'continue' };
+    }),
+    deliver: vi.fn((_sessionId: string, _text: string): boolean => {
+      return true;
+    }),
+    startCleanupInterval: vi.fn(),
+    processFileQueue: vi.fn().mockResolvedValue(undefined),
+    shutdown: vi.fn(),
+  };
+}
+
+function makeTelegramBot() {
+  return {
+    init: vi.fn().mockResolvedValue(undefined),
+    stop: vi.fn().mockResolvedValue(undefined),
+    createTopic: vi.fn().mockResolvedValue(42),
+    sendStartMessage: vi.fn().mockResolvedValue({ messageId: 100 }),
+    sendReconnectMessage: vi.fn().mockResolvedValue(undefined),
+    sendStopMessage: vi.fn().mockResolvedValue(200),
+    sendCompleteMessage: vi.fn().mockResolvedValue(undefined),
+    sendErrorMessage: vi.fn().mockResolvedValue(undefined),
+    addReaction: vi.fn().mockResolvedValue(undefined),
+    getSessionByTopic: vi.fn(),
+    handleResumeCommand: vi.fn().mockResolvedValue(false),
+    onReplyReceived: null as ((sessionId: string, text: string) => void) | null,
+  };
+}
+
+const defaultConfig: DaemonConfig = {
+  botToken: 'test-token',
+  groupId: -1001234567890,
+  topicPrefix: '🔧',
+  hookPort: 9877,
+  hookBaseUrl: 'http://localhost:9877',
+  stopTimeout: 5,
+  liveStream: false,
+  emojiReaction: '👍',
+};
+
+function makeRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
+  const now = new Date().toISOString();
+  return {
+    status: 'active',
+    project: 'test',
+    cwd: '/tmp/test',
+    model: 'gpt-4',
+    topic_id: 0,
+    start_message_id: 0,
+    started_at: now,
+    completed_at: null,
+    stop_message_id: null,
+    reply_message_id: null,
+    total_turns: 0,
+    last_user_message: '',
+    last_turn_output: '',
+    ...overrides,
+  };
+}
+
+describe('SessionManagerImpl', () => {
+  let store: ReturnType<typeof makeStore>;
+  let replyQueue: ReturnType<typeof makeReplyQueue>;
+  let tg: ReturnType<typeof makeTelegramBot>;
+  let manager: SessionManagerImpl;
+
+  beforeEach(() => {
+    store = makeStore();
+    replyQueue = makeReplyQueue();
+    tg = makeTelegramBot();
+    manager = new SessionManagerImpl(
+      store as unknown as SessionsStore,
+      replyQueue as unknown as ReplyQueue,
+      tg as any,
+      defaultConfig
+    );
+  });
+
+  describe('handleSessionStart', () => {
+    it('creates a new session with Telegram topic', async () => {
+      await manager.handleSessionStart({
+        session_id: 's1',
+        model: 'gpt-4',
+        turn_id: 't1',
+        project: 'myproj',
+        cwd: '/tmp/myproj',
+        last_user_message: 'hello',
+      });
+
+      expect(tg.createTopic).toHaveBeenCalledWith('myproj');
+      expect(store.create).toHaveBeenCalledWith('s1', expect.objectContaining({
+        status: 'active',
+        project: 'myproj',
+        topic_id: 42,
+      }));
+      expect(tg.sendStartMessage).toHaveBeenCalled();
+    });
+
+    it('handles reconnection without creating new topic', async () => {
+      store._sessions['s1'] = makeRecord({
+        status: 'active',
+        topic_id: 42,
+      });
+
+      await manager.handleSessionStart({
+        session_id: 's1',
+        model: 'gpt-4',
+        turn_id: 't1',
+        project: 'myproj',
+        cwd: '/tmp/myproj',
+        last_user_message: 'hello',
+        is_reconnect: true,
+      });
+
+      expect(tg.createTopic).not.toHaveBeenCalled();
+      expect(tg.sendReconnectMessage).toHaveBeenCalled();
+      expect(store._sessions['s1'].status).toBe('active');
+    });
+
+    it('throws on invalid state transition for non-reconnect', async () => {
+      store._sessions['s1'] = makeRecord({ status: 'waiting' });
+
+      await expect(manager.handleSessionStart({
+        session_id: 's1',
+        model: 'gpt-4',
+        turn_id: 't1',
+        project: 'myproj',
+        cwd: '/tmp/myproj',
+        last_user_message: 'hello',
+      })).rejects.toThrow(TlError);
+    });
+  });
+
+  describe('handleStopAndWait', () => {
+    it('transitions to waiting and waits for reply', async () => {
+      store._sessions['s1'] = makeRecord({
+        status: 'active',
+        topic_id: 42,
+        total_turns: 5,
+      });
+
+      const result = await manager.handleStopAndWait({
+        session_id: 's1',
+        turn_id: 't1',
+        last_message: 'AI output',
+        total_turns: 5,
+      });
+
+      expect(store.update).toHaveBeenCalled();
+      expect(tg.sendStopMessage).toHaveBeenCalled();
+      expect(result.decision).toBe('continue');
+    });
+
+    it('throws if session not found', async () => {
+      await expect(manager.handleStopAndWait({
+        session_id: 'nope',
+        turn_id: 't1',
+        last_message: 'x',
+        total_turns: 1,
+      })).rejects.toThrow(TlError);
+    });
+
+    it('throws if session is not active', async () => {
+      store._sessions['s1'] = makeRecord({ status: 'waiting' });
+
+      await expect(manager.handleStopAndWait({
+        session_id: 's1',
+        turn_id: 't1',
+        last_message: 'x',
+        total_turns: 1,
+      })).rejects.toThrow(TlError);
+    });
+  });
+
+  describe('handleComplete', () => {
+    it('marks session as completed', async () => {
+      store._sessions['s1'] = makeRecord({
+        status: 'active',
+        topic_id: 42,
+      });
+
+      await manager.handleComplete({
+        session_id: 's1',
+        total_turns: 10,
+        duration: '1h 30m',
+      });
+
+      expect(store._sessions['s1'].status).toBe('completed');
+      expect(store._sessions['s1'].completed_at).not.toBeNull();
+      expect(tg.sendCompleteMessage).toHaveBeenCalled();
+    });
+
+    it('throws if session not found', async () => {
+      await expect(manager.handleComplete({
+        session_id: 'nope',
+        total_turns: 0,
+        duration: '0m',
+      })).rejects.toThrow(TlError);
+    });
+
+    it('throws if session is not active', async () => {
+      store._sessions['s1'] = makeRecord({ status: 'completed' });
+
+      await expect(manager.handleComplete({
+        session_id: 's1',
+        total_turns: 0,
+        duration: '0m',
+      })).rejects.toThrow(TlError);
+    });
+  });
+});

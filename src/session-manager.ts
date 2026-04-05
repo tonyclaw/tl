@@ -1,0 +1,199 @@
+// session-manager.ts — 세션 상태 전이 + TG 연동 조합
+import { SessionManager, HookOutput, DaemonConfig } from './types.js';
+import { SessionsStore } from './store.js';
+import { ReplyQueue } from './reply-queue.js';
+import { TelegramBot } from './telegram.js';
+import { TlError } from './errors.js';
+import { logger } from './logger.js';
+
+export class SessionManagerImpl implements SessionManager {
+  private store: SessionsStore;
+  private replyQueue: ReplyQueue;
+  private tg: TelegramBot;
+  private config: DaemonConfig;
+
+  constructor(
+    store: SessionsStore,
+    replyQueue: ReplyQueue,
+    tg: TelegramBot,
+    config: DaemonConfig
+  ) {
+    this.store = store;
+    this.replyQueue = replyQueue;
+    this.tg = tg;
+    this.config = config;
+  }
+
+  // ===== session-start =====
+
+  async handleSessionStart(args: {
+    session_id: string;
+    model: string;
+    turn_id: string;
+    project: string;
+    cwd: string;
+    last_user_message: string;
+    is_reconnect?: boolean;
+  }): Promise<void> {
+    const { session_id, model, project, is_reconnect } = args;
+
+    // 상태 검증
+    const existing = this.store.get(session_id);
+    if (existing?.record.status === 'active' && !is_reconnect) {
+      throw new TlError('Session already active', 'SESSION_EXISTS');
+    }
+
+    let topic_id: number;
+
+    if (is_reconnect && existing) {
+      // 재연결: 기존 topic_id 재사용
+      topic_id = existing.record.topic_id;
+
+      this.store.update(session_id, (record) => {
+        record.status = 'active';
+        record.started_at = new Date().toISOString();
+        record.model = model;
+        record.total_turns = existing.record.total_turns;
+        record.reply_message_id = null;
+        record.stop_message_id = null;
+        record.last_user_message = args.last_user_message;
+        record.last_turn_output = '';
+      });
+
+      await this.tg.sendReconnectMessage(
+        this.config.groupId,
+        topic_id,
+        session_id
+      );
+    } else {
+      // 새 세션: 토픽 생성
+      topic_id = await this.tg.createTopic(project);
+
+      this.store.create(session_id, {
+        status: 'active',
+        project,
+        cwd: args.cwd,
+        model,
+        topic_id,
+        start_message_id: 0,
+        started_at: new Date().toISOString(),
+        completed_at: null,
+        stop_message_id: null,
+        reply_message_id: null,
+        total_turns: 0,
+        last_user_message: args.last_user_message,
+        last_turn_output: '',
+      });
+
+      await this.tg.sendStartMessage(
+        this.config.groupId,
+        topic_id,
+        session_id,
+        model
+      );
+    }
+
+    logger.info('Session started', {
+      session_id,
+      topic_id,
+      is_reconnect: !!is_reconnect,
+    });
+  }
+
+  // ===== stop-and-wait (long-polling) =====
+
+  async handleStopAndWait(args: {
+    session_id: string;
+    turn_id: string;
+    last_message: string;
+    total_turns: number;
+  }): Promise<HookOutput> {
+    const { session_id, last_message, total_turns } = args;
+
+    const existing = this.store.get(session_id);
+    if (!existing) {
+      throw new TlError('Session not found', 'SESSION_NOT_FOUND');
+    }
+    if (existing.record.status !== 'active') {
+      throw new TlError(
+        `Expected active but was ${existing.record.status}`,
+        'TRANSITION_INVALID'
+      );
+    }
+
+    // 1. 세션을 waiting으로 전이
+    this.store.update(session_id, (record) => {
+      record.status = 'waiting';
+      record.total_turns = total_turns;
+      record.last_turn_output = last_message;
+    });
+
+    // 2. Telegram에 stop 메시지 전송 (답장 대기용)
+    const stopMessageId = await this.tg.sendStopMessage(
+      this.config.groupId,
+      existing.record.topic_id,
+      args.turn_id,
+      last_message,
+      total_turns
+    );
+
+    this.store.update(session_id, (record) => {
+      record.stop_message_id = stopMessageId;
+    });
+
+    // 3. Reply 대기 (long-polling)
+    const reply = await this.replyQueue.waitFor(session_id, this.config.stopTimeout);
+
+    if (reply.decision === 'continue') {
+      // 타임아웃 → active 복귀 (에이전트 계속 진행)
+      this.store.update(session_id, (record) => {
+        record.status = 'active';
+      });
+      return { decision: 'continue' as const };
+    }
+
+    // 4. 사용자 답장 받음 → active 복귀
+    const replyText = reply.decision === 'block' ? reply.reason : 'reply';
+    this.store.update(session_id, (record) => {
+      record.status = 'active';
+      record.last_user_message = replyText;
+    });
+
+    return reply;
+  }
+
+  // ===== complete =====
+
+  async handleComplete(args: {
+    session_id: string;
+    total_turns: number;
+    duration: string;
+  }): Promise<void> {
+    const { session_id, total_turns, duration } = args;
+
+    const existing = this.store.get(session_id);
+    if (!existing) {
+      throw new TlError('Session not found', 'SESSION_NOT_FOUND');
+    }
+    if (existing.record.status !== 'active') {
+      throw new TlError(
+        `Expected active but was ${existing.record.status}`,
+        'TRANSITION_INVALID'
+      );
+    }
+
+    this.store.update(session_id, (record) => {
+      record.status = 'completed';
+      record.completed_at = new Date().toISOString();
+    });
+
+    await this.tg.sendCompleteMessage(
+      this.config.groupId,
+      existing.record.topic_id,
+      total_turns,
+      duration
+    );
+
+    logger.info('Session completed', { session_id, total_turns, duration });
+  }
+}

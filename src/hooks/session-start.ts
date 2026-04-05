@@ -1,0 +1,49 @@
+#!/usr/bin/env node
+// SessionStart 훅 CLI — stdin에서 JSON 읽어서 데몬으로 POST
+
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+
+function getConfigDir(): string {
+  return process.env.TL_CONFIG_DIR || path.join(os.homedir(), '.tl');
+}
+
+async function main() {
+  const configPath = path.join(getConfigDir(), 'config.json');
+  let port = 9877;
+  if (fs.existsSync(configPath)) {
+    try {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      port = config.hookPort || 9877;
+    } catch { /* ignore */ }
+  }
+
+  const stdin = fs.readFileSync(0, 'utf-8');
+  if (!stdin.trim()) {
+    process.stderr.write('No input on stdin\n');
+    process.exit(1);
+  }
+
+  try {
+    const res = await fetch(`http://localhost:${port}/hook/session-start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: stdin,
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      process.stderr.write(`HTTP ${res.status}: ${JSON.stringify(data)}\n`);
+      process.exit(1);
+    }
+
+    process.stdout.write(`Session started: ${data.session_id} (topic: ${data.topic_id})\n`);
+    process.exit(0);
+  } catch (err) {
+    process.stderr.write(`Failed to connect to daemon: ${(err as Error).message}\n`);
+    process.exit(1);
+  }
+}
+
+main();
